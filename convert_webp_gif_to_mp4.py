@@ -37,7 +37,7 @@ def natural_sort_key(path: Path):
 
 
 def find_ffmpeg(script_dir: Path) -> str:
-    local_ffmpeg = script_dir / "ffmpeg" / "bin" / "ffmpeg.exe"
+    local_ffmpeg = app_dir(script_dir) / "ffmpeg" / "bin" / "ffmpeg.exe"
     if local_ffmpeg.exists():
         return str(local_ffmpeg)
 
@@ -52,10 +52,16 @@ def find_ffmpeg(script_dir: Path) -> str:
 
 
 def find_ffprobe(script_dir: Path) -> Optional[str]:
-    local_ffprobe = script_dir / "ffmpeg" / "bin" / "ffprobe.exe"
+    local_ffprobe = app_dir(script_dir) / "ffmpeg" / "bin" / "ffprobe.exe"
     if local_ffprobe.exists():
         return str(local_ffprobe)
     return shutil.which("ffprobe")
+
+
+def app_dir(script_dir: Path) -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return script_dir
 
 
 def list_input_files(folder: Path) -> List[Path]:

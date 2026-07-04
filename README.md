@@ -20,6 +20,14 @@ By default, each input file is converted into its own MP4 file. A merged MP4 can
 
 ## Requirements
 
+If you download the Windows release zip, no Python or FFmpeg installation is required. The release package includes:
+
+- `webp-gif-to-mp4.exe`
+- `ffmpeg/bin/ffmpeg.exe`
+- `ffmpeg/bin/ffprobe.exe`
+
+If you run from source, you need:
+
 - Python 3.8+
 - Pillow
 - FFmpeg and FFprobe
@@ -36,6 +44,16 @@ FFmpeg must be available in `PATH`, or placed next to the script as:
 ffmpeg/bin/ffmpeg.exe
 ffmpeg/bin/ffprobe.exe
 ```
+
+## Windows release usage
+
+Download the release zip, extract it, then run:
+
+```bash
+webp-gif-to-mp4.exe "D:\input-folder"
+```
+
+The bundled FFmpeg files must stay in the extracted `ffmpeg/bin` folder next to the exe.
 
 ## Usage
 

@@ -5,3 +5,7 @@ __pycache__/
 ffmpeg/
 .venv/
 venv/
+build/
+dist/
+release/
+*.spec
