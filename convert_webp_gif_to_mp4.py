@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
@@ -337,6 +338,84 @@ def write_mp4_atomically(
                 pass
 
 
+def ffconcat_escape(path: Path) -> str:
+    value = str(path.resolve()).replace("\\", "/")
+    return value.replace("'", "'\\''")
+
+
+def concat_mp4_copy(
+    ffmpeg: str,
+    ffprobe: Optional[str],
+    input_paths: List[Path],
+    output_path: Path,
+) -> bool:
+    if output_path.exists():
+        logging.info("Skipping existing merged output: %s", output_path)
+        return True
+
+    missing = [path for path in input_paths if not path.exists()]
+    if missing:
+        logging.error(
+            "Cannot fast-merge because these MP4 files are missing: %s",
+            ", ".join(path.name for path in missing),
+        )
+        return False
+
+    temp_output_path = make_temp_output_path(output_path)
+    list_path = Path(tempfile.gettempdir()) / f"webp-gif-to-mp4-{uuid.uuid4().hex}.txt"
+
+    try:
+        with open(list_path, "w", encoding="utf-8") as file:
+            for input_path in input_paths:
+                file.write(f"file '{ffconcat_escape(input_path)}'\n")
+
+        cmd = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_path),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(temp_output_path),
+        ]
+
+        logging.info("Fast-merging %s MP4 files into %s", len(input_paths), output_path)
+        result = subprocess.run(cmd, text=True, capture_output=True)
+        if result.returncode != 0:
+            logging.error("Fast merge failed: %s", result.stderr.strip())
+            return False
+
+        if not validate_mp4(ffprobe, temp_output_path):
+            return False
+
+        if output_path.exists():
+            logging.info("Skipping rename because output already exists: %s", output_path)
+            return True
+
+        temp_output_path.replace(output_path)
+        logging.info("Saved %s", output_path)
+        return True
+    finally:
+        try:
+            list_path.unlink()
+        except FileNotFoundError:
+            pass
+        if temp_output_path.exists():
+            try:
+                temp_output_path.unlink()
+            except OSError:
+                pass
+
+
 def resolve_output_path(output_dir: Path, source_path: Path) -> Path:
     return output_dir / f"{source_path.stem}.mp4"
 
@@ -421,6 +500,7 @@ def convert_folder(
     merge: bool,
     merge_output_dir: Optional[Path],
     merge_output_name: str,
+    merge_mode: str,
     fps: float,
     crf: int,
     preset: str,
@@ -466,6 +546,7 @@ def convert_folder(
 
     failed = []
     planned_outputs = set()
+    individual_outputs = []
     jobs = []
     for path in files:
         output_path = resolve_output_path(output_dir, path)
@@ -478,6 +559,7 @@ def convert_folder(
             continue
 
         planned_outputs.add(output_path)
+        individual_outputs.append(output_path)
         if output_path.exists():
             logging.info("Skipping existing output: %s", output_path)
             continue
@@ -524,19 +606,39 @@ def convert_folder(
         if merge_output_path.exists():
             logging.info("Skipping existing merged output: %s", merge_output_path)
         else:
-            logging.info("Creating merged output: %s", merge_output_path)
-            canvas_size = get_canvas_size(files)
-            frames = iter_video_frames(files, canvas_size, fps, background_rgb)
-            ok = write_mp4_atomically(
-                ffmpeg,
-                ffprobe,
-                frames,
-                merge_output_path,
-                fps,
-                crf,
-                preset,
-                ffmpeg_threads,
-            )
+            if failed:
+                logging.error("Skipping merge because some individual conversions failed.")
+                ok = False
+            elif merge_mode in {"auto", "copy"}:
+                ok = concat_mp4_copy(ffmpeg, ffprobe, individual_outputs, merge_output_path)
+                if not ok and merge_mode == "auto":
+                    logging.warning("Fast merge failed; falling back to re-encode merge.")
+                    canvas_size = get_canvas_size(files)
+                    frames = iter_video_frames(files, canvas_size, fps, background_rgb)
+                    ok = write_mp4_atomically(
+                        ffmpeg,
+                        ffprobe,
+                        frames,
+                        merge_output_path,
+                        fps,
+                        crf,
+                        preset,
+                        ffmpeg_threads,
+                    )
+            else:
+                logging.info("Creating merged output by re-encoding: %s", merge_output_path)
+                canvas_size = get_canvas_size(files)
+                frames = iter_video_frames(files, canvas_size, fps, background_rgb)
+                ok = write_mp4_atomically(
+                    ffmpeg,
+                    ffprobe,
+                    frames,
+                    merge_output_path,
+                    fps,
+                    crf,
+                    preset,
+                    ffmpeg_threads,
+                )
             if not ok:
                 failed.append(merge_output_path.name)
 
@@ -575,6 +677,16 @@ def main() -> int:
         "--merge-output",
         default="merged.mp4",
         help="Merged MP4 filename. Default: merged.mp4.",
+    )
+    parser.add_argument(
+        "--merge-mode",
+        choices=("auto", "copy", "reencode"),
+        default="auto",
+        help=(
+            "Merge strategy. auto tries fast stream-copy concat first and falls back "
+            "to re-encoding; copy only uses fast concat; reencode uses the slower "
+            "compatibility path. Default: auto."
+        ),
     )
     parser.add_argument(
         "--fps",
@@ -616,6 +728,7 @@ def main() -> int:
             merge=args.merge,
             merge_output_dir=Path(args.merge_output_dir) if args.merge_output_dir else None,
             merge_output_name=args.merge_output,
+            merge_mode=args.merge_mode,
             fps=args.fps,
             crf=args.crf,
             preset=args.preset,
