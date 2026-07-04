@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
@@ -267,6 +268,69 @@ def write_mp4(
     return True
 
 
+def make_temp_output_path(output_path: Path) -> Path:
+    return output_path.with_name(
+        f".{output_path.stem}.{os.getpid()}.{uuid.uuid4().hex}.tmp{output_path.suffix}"
+    )
+
+
+def cleanup_stale_temp_outputs(directory: Path) -> None:
+    for path in directory.glob(".*.tmp.mp4"):
+        if path.is_file():
+            try:
+                path.unlink()
+                logging.info("Removed stale temp file: %s", path)
+            except OSError as exc:
+                logging.warning("Could not remove stale temp file %s: %s", path, exc)
+
+
+def write_mp4_atomically(
+    ffmpeg: str,
+    ffprobe: Optional[str],
+    frames: Iterable[bytes],
+    output_path: Path,
+    fps: float,
+    crf: int,
+    preset: str,
+    ffmpeg_threads: int,
+) -> bool:
+    if output_path.exists():
+        logging.info("Skipping existing output: %s", output_path)
+        return True
+
+    temp_output_path = make_temp_output_path(output_path)
+    try:
+        ok = write_mp4(
+            ffmpeg,
+            ffprobe,
+            frames,
+            temp_output_path,
+            fps,
+            crf,
+            preset,
+            ffmpeg_threads,
+        )
+        if not ok:
+            return False
+
+        if output_path.exists():
+            logging.info(
+                "Skipping rename because output already exists: %s",
+                output_path,
+            )
+            return True
+
+        temp_output_path.replace(output_path)
+        logging.info("Saved %s", output_path)
+        return True
+    finally:
+        if temp_output_path.exists():
+            try:
+                temp_output_path.unlink()
+            except OSError:
+                pass
+
+
 def resolve_output_path(output_dir: Path, source_path: Path) -> Path:
     return output_dir / f"{source_path.stem}.mp4"
 
@@ -283,11 +347,24 @@ def convert_one_file(
     ffmpeg_threads: int,
 ) -> bool:
     output_path = resolve_output_path(output_dir, source_path)
+    if output_path.exists():
+        logging.info("Skipping existing output: %s", output_path)
+        return True
+
     canvas_size = get_canvas_size([source_path])
     frames = iter_video_frames([source_path], canvas_size, fps, background_rgb)
 
     logging.info("Converting %s -> %s", source_path.name, output_path.name)
-    return write_mp4(ffmpeg, ffprobe, frames, output_path, fps, crf, preset, ffmpeg_threads)
+    return write_mp4_atomically(
+        ffmpeg,
+        ffprobe,
+        frames,
+        output_path,
+        fps,
+        crf,
+        preset,
+        ffmpeg_threads,
+    )
 
 
 def convert_one_file_job(args) -> Tuple[str, bool]:
@@ -354,6 +431,10 @@ def convert_folder(
     output_dir.mkdir(parents=True, exist_ok=True)
     merge_output_dir.mkdir(parents=True, exist_ok=True)
 
+    cleanup_stale_temp_outputs(output_dir)
+    if merge_output_dir != output_dir:
+        cleanup_stale_temp_outputs(merge_output_dir)
+
     script_dir = Path(__file__).resolve().parent
     ffmpeg = find_ffmpeg(script_dir)
     ffprobe = find_ffprobe(script_dir)
@@ -378,20 +459,43 @@ def convert_folder(
     logging.info("FFmpeg threads per worker: %s", ffmpeg_threads)
 
     failed = []
-    jobs = [
-        (
-            ffmpeg,
-            ffprobe,
-            path,
-            output_dir,
-            fps,
-            crf,
-            preset,
-            background_rgb,
-            ffmpeg_threads,
+    planned_outputs = set()
+    jobs = []
+    for path in files:
+        output_path = resolve_output_path(output_dir, path)
+        if output_path in planned_outputs:
+            logging.warning(
+                "Skipping %s because another input maps to %s",
+                path.name,
+                output_path.name,
+            )
+            continue
+
+        planned_outputs.add(output_path)
+        if output_path.exists():
+            logging.info("Skipping existing output: %s", output_path)
+            continue
+
+        jobs.append(
+            (
+                ffmpeg,
+                ffprobe,
+                path,
+                output_dir,
+                fps,
+                crf,
+                preset,
+                background_rgb,
+                ffmpeg_threads,
+            )
         )
-        for path in files
-    ]
+
+    skipped_duplicates = len(files) - len(planned_outputs)
+    if skipped_duplicates:
+        logging.warning(
+            "Skipped %s input file(s) because another file maps to the same MP4 name.",
+            skipped_duplicates,
+        )
 
     if workers == 1:
         for job in jobs:
@@ -411,21 +515,24 @@ def convert_folder(
         if merge_output_path.suffix.lower() != ".mp4":
             merge_output_path = merge_output_path.with_suffix(".mp4")
 
-        logging.info("Creating merged output: %s", merge_output_path)
-        canvas_size = get_canvas_size(files)
-        frames = iter_video_frames(files, canvas_size, fps, background_rgb)
-        ok = write_mp4(
-            ffmpeg,
-            ffprobe,
-            frames,
-            merge_output_path,
-            fps,
-            crf,
-            preset,
-            ffmpeg_threads,
-        )
-        if not ok:
-            failed.append(merge_output_path.name)
+        if merge_output_path.exists():
+            logging.info("Skipping existing merged output: %s", merge_output_path)
+        else:
+            logging.info("Creating merged output: %s", merge_output_path)
+            canvas_size = get_canvas_size(files)
+            frames = iter_video_frames(files, canvas_size, fps, background_rgb)
+            ok = write_mp4_atomically(
+                ffmpeg,
+                ffprobe,
+                frames,
+                merge_output_path,
+                fps,
+                crf,
+                preset,
+                ffmpeg_threads,
+            )
+            if not ok:
+                failed.append(merge_output_path.name)
 
     if failed:
         logging.error("Failed outputs: %s", ", ".join(failed))

@@ -12,6 +12,8 @@ By default, each input file is converted into its own MP4 file. A merged MP4 can
 - Optional `--merge` mode creates an additional merged MP4.
 - Supports custom output directories for individual and merged MP4 files.
 - Parallel conversion for individual files, with configurable worker count.
+- Skips outputs that already exist, so repeated runs do not create duplicate MP4 files.
+- Writes to temporary `.tmp.mp4` files first, then renames after successful validation.
 - Handles transparent frames with a configurable background color.
 - Outputs widely compatible `H.264 + yuv420p` MP4 files.
 - Validates output with `ffprobe` when available.
@@ -117,3 +119,7 @@ Timing is approximated by repeating frames into a constant-FPS video stream. Thi
 Individual file conversion is parallelized by default. For folders with many files, this can keep CPU usage much higher than serial conversion. If the machine becomes less responsive, lower `--workers`; if CPU usage is still low, raise `--workers` or `--ffmpeg-threads`.
 
 Merged output is encoded as one additional pass after the individual files are converted. This keeps merge ordering deterministic and avoids multiple processes writing the same output file.
+
+If an output MP4 with the target filename already exists, the tool skips that input file. This makes repeated runs safe and avoids duplicate output names.
+
+During conversion, output is first written to a hidden temporary file such as `.example.<pid>.<id>.tmp.mp4`. Only after FFmpeg finishes and validation passes is the temporary file renamed to `example.mp4`. If a previous run was interrupted, stale `.tmp.mp4` files are cleaned up automatically on the next run.
