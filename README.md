@@ -56,6 +56,17 @@ webp-gif-to-mp4.exe "D:\input-folder"
 
 The bundled FFmpeg files must stay in the extracted `ffmpeg/bin` folder next to the exe.
 
+You can also place the extracted files directly in a folder containing `.webp` / `.gif` files and double-click `webp-gif-to-mp4.exe`.
+
+Double-click mode automatically:
+
+- Converts all `.webp` / `.gif` files in the exe folder.
+- Creates individual MP4 files.
+- Also creates `merged.mp4`.
+- Keeps the console open when finished.
+
+This automatic merge behavior only applies to the packaged Windows exe when launched with no command-line arguments. Running the Python script with no arguments still converts individual files only unless `--merge` is provided.
+
 ## Usage
 
 Convert all `.webp` and `.gif` files in the current folder:
@@ -108,6 +119,14 @@ Use smoother timing:
 python convert_webp_gif_to_mp4.py "D:\input-folder" --fps 60
 ```
 
+By default, the tool uses each input file's source FPS:
+
+```bash
+python convert_webp_gif_to_mp4.py "D:\input-folder"
+```
+
+Use `--fps` only when you want to force every output to the same FPS.
+
 Use a white background for transparent frames:
 
 ```bash
@@ -136,7 +155,7 @@ python convert_webp_gif_to_mp4.py "D:\input-folder" --workers 4 --ffmpeg-threads
 | `--merge-output-dir` | `--output-dir` | Directory for the merged MP4. |
 | `--merge-output` | `merged.mp4` | Merged MP4 filename. |
 | `--merge-mode` | `auto` | Merge strategy: `auto`, `copy`, or `reencode`. |
-| `--fps` | `30` | Constant output FPS. Use `60` for smoother timing. |
+| `--fps` | source FPS | Override output FPS. If omitted, each input file uses its source FPS. |
 | `--crf` | `23` | x264 quality. Lower means better quality and larger files. |
 | `--preset` | `veryfast` | x264 encoding preset, such as `ultrafast`, `veryfast`, `medium`. |
 | `--background` | `black` | Background for transparent frames: `black`, `white`, `gray`, or `#RRGGBB`. |
@@ -149,6 +168,10 @@ python convert_webp_gif_to_mp4.py "D:\input-folder" --workers 4 --ffmpeg-threads
 The tool uses Pillow to decode WEBP/GIF frames and sends PNG frames through a pipe to FFmpeg. This avoids writing temporary frame files to disk while keeping MP4 output compatible with common players.
 
 Timing is approximated by repeating frames into a constant-FPS video stream. This is usually stable for GIF/WEBP animations and keeps output broadly playable.
+
+By default, each input file uses its own source FPS. If the source animations have different FPS values, their generated MP4 files may also have different stream parameters. In that case, fast merge may not be safe. The default `--merge-mode auto` checks stream compatibility first: if fast concat is unsafe, it falls back to re-encoding the merged output.
+
+If you want fast stream-copy merge to be more likely, force a common FPS for every output, for example `--fps 30` or `--fps 60`.
 
 Individual file conversion is parallelized by default. For folders with many files, this can keep CPU usage much higher than serial conversion. If the machine becomes less responsive, lower `--workers`; if CPU usage is still low, raise `--workers` or `--ffmpeg-threads`.
 

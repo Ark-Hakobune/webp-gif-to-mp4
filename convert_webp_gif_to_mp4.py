@@ -1,7 +1,10 @@
 import argparse
 import concurrent.futures
 import io
+import json
 import logging
+import math
+import multiprocessing
 import os
 import re
 import shutil
@@ -10,6 +13,7 @@ import sys
 import tempfile
 import uuid
 from pathlib import Path
+from functools import reduce
 from typing import Iterable, List, Optional, Tuple
 
 from PIL import Image, ImageSequence
@@ -107,6 +111,31 @@ def frame_duration_ms(frame: Image.Image, image: Image.Image, default_duration: 
     return max(1, int(duration))
 
 
+def get_frame_durations_ms(path: Path, default_duration: int = 100) -> List[int]:
+    durations = []
+    with Image.open(path) as image:
+        for frame in ImageSequence.Iterator(image):
+            durations.append(frame_duration_ms(frame, image, default_duration))
+    return durations or [default_duration]
+
+
+def get_source_fps(path: Path) -> float:
+    durations = get_frame_durations_ms(path)
+    unique_durations = set(durations)
+
+    if len(unique_durations) == 1:
+        fps = 1000.0 / next(iter(unique_durations))
+    else:
+        duration_gcd = reduce(math.gcd, durations)
+        fps_from_gcd = 1000.0 / max(1, duration_gcd)
+        if fps_from_gcd <= 120.0:
+            fps = fps_from_gcd
+        else:
+            fps = len(durations) * 1000.0 / sum(durations)
+
+    return max(1.0, min(fps, 240.0))
+
+
 def frame_repeat_count(duration_ms: int, fps: float) -> int:
     return max(1, int(round(duration_ms * fps / 1000.0)))
 
@@ -202,6 +231,69 @@ def validate_mp4(ffprobe: Optional[str], output_path: Path) -> bool:
     info = result.stdout.strip()
     logging.info("Output validation passed:\n%s", info)
     return "codec_name=h264" in info and "pix_fmt=yuv420p" in info
+
+
+def get_mp4_stream_signature(ffprobe: Optional[str], path: Path) -> Optional[Tuple[str, ...]]:
+    if not ffprobe:
+        return None
+
+    result = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,width,height,pix_fmt,r_frame_rate,avg_frame_rate,time_base",
+            "-of",
+            "json",
+            str(path),
+        ],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        logging.error("Could not inspect %s: %s", path, result.stderr.strip())
+        return None
+
+    data = json.loads(result.stdout)
+    streams = data.get("streams") or []
+    if not streams:
+        logging.error("Could not inspect %s: no video stream found", path)
+        return None
+
+    stream = streams[0]
+    return (
+        str(stream.get("codec_name")),
+        str(stream.get("width")),
+        str(stream.get("height")),
+        str(stream.get("pix_fmt")),
+        str(stream.get("r_frame_rate")),
+        str(stream.get("avg_frame_rate")),
+        str(stream.get("time_base")),
+    )
+
+
+def mp4_streams_can_copy_merge(ffprobe: Optional[str], input_paths: List[Path]) -> bool:
+    if not ffprobe:
+        logging.warning("ffprobe was not found; fast merge compatibility check is skipped.")
+        return True
+
+    signatures = [get_mp4_stream_signature(ffprobe, path) for path in input_paths]
+    if any(signature is None for signature in signatures):
+        return False
+
+    first_signature = signatures[0]
+    for path, signature in zip(input_paths[1:], signatures[1:]):
+        if signature != first_signature:
+            logging.warning(
+                "Fast merge is not safe because %s has different stream parameters.",
+                path.name,
+            )
+            return False
+
+    return True
 
 
 def write_mp4(
@@ -361,6 +453,9 @@ def concat_mp4_copy(
         )
         return False
 
+    if not mp4_streams_can_copy_merge(ffprobe, input_paths):
+        return False
+
     temp_output_path = make_temp_output_path(output_path)
     list_path = Path(tempfile.gettempdir()) / f"webp-gif-to-mp4-{uuid.uuid4().hex}.txt"
 
@@ -501,7 +596,7 @@ def convert_folder(
     merge_output_dir: Optional[Path],
     merge_output_name: str,
     merge_mode: str,
-    fps: float,
+    fps: Optional[float],
     crf: int,
     preset: str,
     background: str,
@@ -536,11 +631,19 @@ def convert_folder(
         logging.info("  %s. %s", index, path.name)
 
     background_rgb = parse_color(background)
+    source_fps_by_path = {path: get_source_fps(path) for path in files}
+    merge_fps = fps if fps is not None else max(source_fps_by_path.values())
     workers = default_worker_count(len(files)) if workers <= 0 else max(1, workers)
     workers = min(workers, len(files))
     ffmpeg_threads = ffmpeg_threads_per_worker(workers, ffmpeg_threads)
 
-    logging.info("Output FPS: %.3f", fps)
+    if fps is None:
+        logging.info("Output FPS: source FPS per input file")
+        for path in files:
+            logging.info("  %s: %.3f FPS", path.name, source_fps_by_path[path])
+        logging.info("Merge re-encode FPS: %.3f", merge_fps)
+    else:
+        logging.info("Output FPS override: %.3f", fps)
     logging.info("Workers: %s", workers)
     logging.info("FFmpeg threads per worker: %s", ffmpeg_threads)
 
@@ -570,7 +673,7 @@ def convert_folder(
                 ffprobe,
                 path,
                 output_dir,
-                fps,
+                fps if fps is not None else source_fps_by_path[path],
                 crf,
                 preset,
                 background_rgb,
@@ -614,13 +717,13 @@ def convert_folder(
                 if not ok and merge_mode == "auto":
                     logging.warning("Fast merge failed; falling back to re-encode merge.")
                     canvas_size = get_canvas_size(files)
-                    frames = iter_video_frames(files, canvas_size, fps, background_rgb)
+                    frames = iter_video_frames(files, canvas_size, merge_fps, background_rgb)
                     ok = write_mp4_atomically(
                         ffmpeg,
                         ffprobe,
                         frames,
                         merge_output_path,
-                        fps,
+                        merge_fps,
                         crf,
                         preset,
                         ffmpeg_threads,
@@ -628,13 +731,13 @@ def convert_folder(
             else:
                 logging.info("Creating merged output by re-encoding: %s", merge_output_path)
                 canvas_size = get_canvas_size(files)
-                frames = iter_video_frames(files, canvas_size, fps, background_rgb)
+                frames = iter_video_frames(files, canvas_size, merge_fps, background_rgb)
                 ok = write_mp4_atomically(
                     ffmpeg,
                     ffprobe,
                     frames,
                     merge_output_path,
-                    fps,
+                    merge_fps,
                     crf,
                     preset,
                     ffmpeg_threads,
@@ -651,6 +754,8 @@ def convert_folder(
 
 
 def main() -> int:
+    double_click_mode = bool(getattr(sys, "frozen", False) and len(sys.argv) == 1)
+
     parser = argparse.ArgumentParser(
         description="Convert WEBP/GIF files in a folder to playable MP4 files."
     )
@@ -691,8 +796,8 @@ def main() -> int:
     parser.add_argument(
         "--fps",
         type=float,
-        default=30.0,
-        help="Output constant FPS. 30 is stable and efficient; use 60 for smoother timing.",
+        default=None,
+        help="Override output FPS. Default: use each input file's source FPS.",
     )
     parser.add_argument("--crf", type=int, default=23, help="Quality. Lower is better.")
     parser.add_argument(
@@ -720,9 +825,11 @@ def main() -> int:
     )
 
     args = parser.parse_args()
+    if double_click_mode:
+        args.merge = True
 
     try:
-        return convert_folder(
+        exit_code = convert_folder(
             folder=Path(args.folder),
             output_dir=Path(args.output_dir) if args.output_dir else None,
             merge=args.merge,
@@ -737,13 +844,18 @@ def main() -> int:
             workers=args.workers,
             ffmpeg_threads=args.ffmpeg_threads,
         )
+        return exit_code
     except KeyboardInterrupt:
         print("\nCancelled.")
         return 130
     except Exception as exc:
         logging.error("Operation not completed: %s", exc)
         return 1
+    finally:
+        if double_click_mode:
+            input("\nPress Enter to exit...")
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     sys.exit(main())
