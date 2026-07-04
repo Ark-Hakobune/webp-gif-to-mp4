@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*.log
+*.mp4
+ffmpeg/
+.venv/
+venv/
