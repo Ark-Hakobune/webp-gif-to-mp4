@@ -1,6 +1,8 @@
 import argparse
+import concurrent.futures
 import io
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -202,6 +204,7 @@ def write_mp4(
     fps: float,
     crf: int,
     preset: str,
+    ffmpeg_threads: int,
 ) -> bool:
     cmd = [
         ffmpeg,
@@ -220,6 +223,8 @@ def write_mp4(
         "-an",
         "-c:v",
         "libx264",
+        "-threads",
+        str(ffmpeg_threads),
         "-preset",
         preset,
         "-crf",
@@ -275,13 +280,56 @@ def convert_one_file(
     crf: int,
     preset: str,
     background_rgb: Tuple[int, int, int],
+    ffmpeg_threads: int,
 ) -> bool:
     output_path = resolve_output_path(output_dir, source_path)
     canvas_size = get_canvas_size([source_path])
     frames = iter_video_frames([source_path], canvas_size, fps, background_rgb)
 
     logging.info("Converting %s -> %s", source_path.name, output_path.name)
-    return write_mp4(ffmpeg, ffprobe, frames, output_path, fps, crf, preset)
+    return write_mp4(ffmpeg, ffprobe, frames, output_path, fps, crf, preset, ffmpeg_threads)
+
+
+def convert_one_file_job(args) -> Tuple[str, bool]:
+    (
+        ffmpeg,
+        ffprobe,
+        source_path,
+        output_dir,
+        fps,
+        crf,
+        preset,
+        background_rgb,
+        ffmpeg_threads,
+    ) = args
+
+    ok = convert_one_file(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        source_path=source_path,
+        output_dir=output_dir,
+        fps=fps,
+        crf=crf,
+        preset=preset,
+        background_rgb=background_rgb,
+        ffmpeg_threads=ffmpeg_threads,
+    )
+    return source_path.name, ok
+
+
+def default_worker_count(file_count: int) -> int:
+    cpu_count = os.cpu_count() or 1
+    if file_count <= 1:
+        return 1
+    return max(1, min(file_count, cpu_count))
+
+
+def ffmpeg_threads_per_worker(worker_count: int, requested_threads: int) -> int:
+    if requested_threads > 0:
+        return requested_threads
+
+    cpu_count = os.cpu_count() or 1
+    return max(1, cpu_count // max(1, worker_count))
 
 
 def convert_folder(
@@ -295,6 +343,8 @@ def convert_folder(
     preset: str,
     background: str,
     log_to_file: bool,
+    workers: int,
+    ffmpeg_threads: int,
 ) -> int:
     configure_logging(log_to_file)
 
@@ -319,22 +369,42 @@ def convert_folder(
         logging.info("  %s. %s", index, path.name)
 
     background_rgb = parse_color(background)
+    workers = default_worker_count(len(files)) if workers <= 0 else max(1, workers)
+    workers = min(workers, len(files))
+    ffmpeg_threads = ffmpeg_threads_per_worker(workers, ffmpeg_threads)
+
     logging.info("Output FPS: %.3f", fps)
+    logging.info("Workers: %s", workers)
+    logging.info("FFmpeg threads per worker: %s", ffmpeg_threads)
 
     failed = []
-    for path in files:
-        ok = convert_one_file(
-            ffmpeg=ffmpeg,
-            ffprobe=ffprobe,
-            source_path=path,
-            output_dir=output_dir,
-            fps=fps,
-            crf=crf,
-            preset=preset,
-            background_rgb=background_rgb,
+    jobs = [
+        (
+            ffmpeg,
+            ffprobe,
+            path,
+            output_dir,
+            fps,
+            crf,
+            preset,
+            background_rgb,
+            ffmpeg_threads,
         )
-        if not ok:
-            failed.append(path.name)
+        for path in files
+    ]
+
+    if workers == 1:
+        for job in jobs:
+            file_name, ok = convert_one_file_job(job)
+            if not ok:
+                failed.append(file_name)
+    else:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(convert_one_file_job, job) for job in jobs]
+            for future in concurrent.futures.as_completed(futures):
+                file_name, ok = future.result()
+                if not ok:
+                    failed.append(file_name)
 
     if merge:
         merge_output_path = merge_output_dir / merge_output_name
@@ -352,6 +422,7 @@ def convert_folder(
             fps,
             crf,
             preset,
+            ffmpeg_threads,
         )
         if not ok:
             failed.append(merge_output_path.name)
@@ -410,6 +481,18 @@ def main() -> int:
         help="Background for transparent frames: black, white, gray, or #RRGGBB.",
     )
     parser.add_argument("--log", action="store_true", help="Write webp_gif_to_mp4.log.")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Parallel conversion workers. Default: auto, using up to the CPU core count.",
+    )
+    parser.add_argument(
+        "--ffmpeg-threads",
+        type=int,
+        default=0,
+        help="FFmpeg threads per worker. Default: auto, CPU cores divided by workers.",
+    )
 
     args = parser.parse_args()
 
@@ -425,6 +508,8 @@ def main() -> int:
             preset=args.preset,
             background=args.background,
             log_to_file=args.log,
+            workers=args.workers,
+            ffmpeg_threads=args.ffmpeg_threads,
         )
     except KeyboardInterrupt:
         print("\nCancelled.")

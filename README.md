@@ -11,6 +11,7 @@ By default, each input file is converted into its own MP4 file. A merged MP4 can
 - Default mode creates one MP4 per input file.
 - Optional `--merge` mode creates an additional merged MP4.
 - Supports custom output directories for individual and merged MP4 files.
+- Parallel conversion for individual files, with configurable worker count.
 - Handles transparent frames with a configurable background color.
 - Outputs widely compatible `H.264 + yuv420p` MP4 files.
 - Validates output with `ffprobe` when available.
@@ -78,6 +79,18 @@ Use a white background for transparent frames:
 python convert_webp_gif_to_mp4.py "D:\input-folder" --background white
 ```
 
+Use more parallel workers:
+
+```bash
+python convert_webp_gif_to_mp4.py "D:\input-folder" --workers 8
+```
+
+Let each FFmpeg process use more threads:
+
+```bash
+python convert_webp_gif_to_mp4.py "D:\input-folder" --workers 4 --ffmpeg-threads 2
+```
+
 ## Options
 
 | Option | Default | Description |
@@ -92,9 +105,15 @@ python convert_webp_gif_to_mp4.py "D:\input-folder" --background white
 | `--preset` | `veryfast` | x264 encoding preset, such as `ultrafast`, `veryfast`, `medium`. |
 | `--background` | `black` | Background for transparent frames: `black`, `white`, `gray`, or `#RRGGBB`. |
 | `--log` | off | Write `webp_gif_to_mp4.log`. |
+| `--workers` | auto | Parallel conversion workers for individual files. Auto uses up to the CPU core count. |
+| `--ffmpeg-threads` | auto | FFmpeg threads per worker. Auto divides CPU cores across workers. |
 
 ## Notes
 
 The tool uses Pillow to decode WEBP/GIF frames and sends PNG frames through a pipe to FFmpeg. This avoids writing temporary frame files to disk while keeping MP4 output compatible with common players.
 
 Timing is approximated by repeating frames into a constant-FPS video stream. This is usually stable for GIF/WEBP animations and keeps output broadly playable.
+
+Individual file conversion is parallelized by default. For folders with many files, this can keep CPU usage much higher than serial conversion. If the machine becomes less responsive, lower `--workers`; if CPU usage is still low, raise `--workers` or `--ffmpeg-threads`.
+
+Merged output is encoded as one additional pass after the individual files are converted. This keeps merge ordering deterministic and avoids multiple processes writing the same output file.
